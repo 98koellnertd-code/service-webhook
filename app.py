@@ -1,15 +1,18 @@
 """
-Brevo Inbound Webhook – empfängt Serviceberichte per E-Mail und speichert sie in der DB.
+Inbound Webhook – empfängt Serviceberichte per E-Mail und speichert sie in der DB.
+Unterstützt: Mailgun + Brevo
 
 Ablauf:
-  Mail mit PDF-Anhang → Brevo → POST /webhook/brevo?token=SECRET → Claude analysiert → PostgreSQL
+  Mail mit PDF-Anhang → Mailgun/Brevo → POST /webhook/mailgun oder /webhook/brevo → Claude → PostgreSQL
 
 Setup:
-  1. Railway: Env-Variablen setzen (ANTHROPIC_API_KEY, DATABASE_URL, WEBHOOK_TOKEN)
-  2. Brevo: Inbound Parsing → Webhook URL: https://swebhook.up.railway.app/webhook/brevo?token=DEIN_TOKEN
+  1. Railway: Env-Variablen setzen (ANTHROPIC_API_KEY, DATABASE_URL, MAILGUN_SIGNING_KEY)
+  2. Mailgun: Route → Forward → https://swebhook.up.railway.app/webhook/mailgun
 """
 
 import os
+import hmac
+import hashlib
 import logging
 import json
 import base64
@@ -26,9 +29,10 @@ import anthropic
 import psycopg2
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-DATABASE_URL      = os.environ["DATABASE_URL"]
-WEBHOOK_TOKEN     = os.getenv("WEBHOOK_TOKEN", "")  # optionaler Schutz-Token
+ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
+DATABASE_URL        = os.environ["DATABASE_URL"]
+MAILGUN_SIGNING_KEY = os.getenv("MAILGUN_SIGNING_KEY", "")
+WEBHOOK_TOKEN       = os.getenv("WEBHOOK_TOKEN", "")
 
 app    = Flask(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -181,6 +185,67 @@ def speichere_in_db(daten: dict) -> int:
     return bericht_id
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Hilfsfunktionen
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _verify_mailgun(token: str, timestamp: str, signature: str) -> bool:
+    if not MAILGUN_SIGNING_KEY:
+        log.warning("MAILGUN_SIGNING_KEY nicht gesetzt – Signaturprüfung übersprungen")
+        return True
+    data     = f"{timestamp}{token}".encode()
+    computed = hmac.new(MAILGUN_SIGNING_KEY.encode(), data, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed, signature)
+
+
+def _process_pdf(pdf_bytes: bytes, filename: str) -> dict:
+    """PDF analysieren und in DB speichern – gemeinsam für alle Endpoints."""
+    daten      = analysiere_pdf(pdf_bytes)
+    bericht_id = speichere_in_db(daten)
+    terminnr   = daten.get("terminnummer", "?")
+    kunde      = (daten.get("kunde") or {}).get("name", "?")
+    log.info(f"  ✅ Bericht-ID {bericht_id}: {terminnr} – {kunde}")
+    return {"terminnr": terminnr, "kunde": kunde, "id": bericht_id}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Webhook-Endpoint (Mailgun)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/webhook/mailgun", methods=["POST"])
+def mailgun_inbound():
+    token     = request.form.get("token",     "")
+    timestamp = request.form.get("timestamp", "")
+    signature = request.form.get("signature", "")
+
+    if not _verify_mailgun(token, timestamp, signature):
+        log.warning("Ungültige Mailgun-Signatur – abgewiesen")
+        return jsonify({"error": "forbidden"}), 403
+
+    sender  = request.form.get("from",    "?")
+    subject = request.form.get("subject", "")
+    n_att   = int(request.form.get("attachment-count", 0))
+    log.info(f"Mailgun: von {sender!r}  Betreff: {subject!r}  Anhänge: {n_att}")
+
+    if n_att == 0:
+        return jsonify({"status": "no_attachments"}), 200
+
+    processed, errors = [], []
+    for i in range(1, n_att + 1):
+        f = request.files.get(f"attachment-{i}")
+        if not f or not f.filename.lower().endswith(".pdf"):
+            continue
+        log.info(f"  Analysiere {f.filename} …")
+        try:
+            processed.append(_process_pdf(f.read(), f.filename))
+        except Exception as e:
+            log.error(f"  ❌ {f.filename}: {e}")
+            errors.append({"file": f.filename, "error": str(e)})
+
+    status = "ok" if not errors else ("partial" if processed else "error")
+    return jsonify({"status": status, "processed": processed, "errors": errors}), 200
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Webhook-Endpoint (Brevo)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -215,15 +280,9 @@ def brevo_inbound():
 
         log.info(f"  Analysiere {name} …")
         try:
-            pdf_bytes  = base64.b64decode(b64_content)
-            daten      = analysiere_pdf(pdf_bytes)
-            bericht_id = speichere_in_db(daten)
-            terminnr   = daten.get("terminnummer", "?")
-            kunde      = (daten.get("kunde") or {}).get("name", "?")
-            log.info(f"  ✅ Bericht-ID {bericht_id}: {terminnr} – {kunde}")
-            processed.append({"terminnr": terminnr, "kunde": kunde, "id": bericht_id})
+            processed.append(_process_pdf(base64.b64decode(b64_content), name))
         except Exception as e:
-            log.error(f"  ❌ Fehler bei {name}: {e}")
+            log.error(f"  ❌ {name}: {e}")
             errors.append({"file": name, "error": str(e)})
 
     status = "ok" if not errors else ("partial" if processed else "error")
