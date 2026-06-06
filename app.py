@@ -16,6 +16,7 @@ import hashlib
 import logging
 import json
 import base64
+import threading
 
 from flask import Flask, request, jsonify
 
@@ -229,20 +230,24 @@ def mailgun_inbound():
     if n_att == 0:
         return jsonify({"status": "no_attachments"}), 200
 
-    processed, errors = [], []
+    # PDFs sofort einlesen (request-Kontext lebt nur während des Requests)
+    pdfs = []
     for i in range(1, n_att + 1):
         f = request.files.get(f"attachment-{i}")
-        if not f or not f.filename.lower().endswith(".pdf"):
-            continue
-        log.info(f"  Analysiere {f.filename} …")
-        try:
-            processed.append(_process_pdf(f.read(), f.filename))
-        except Exception as e:
-            log.error(f"  ❌ {f.filename}: {e}")
-            errors.append({"file": f.filename, "error": str(e)})
+        if f and f.filename.lower().endswith(".pdf"):
+            pdfs.append((f.filename, f.read()))
 
-    status = "ok" if not errors else ("partial" if processed else "error")
-    return jsonify({"status": status, "processed": processed, "errors": errors}), 200
+    # Sofort 200 zurückgeben – Analyse läuft im Hintergrund
+    def process_in_background():
+        for filename, pdf_bytes in pdfs:
+            log.info(f"  Analysiere {filename} …")
+            try:
+                _process_pdf(pdf_bytes, filename)
+            except Exception as e:
+                log.error(f"  ❌ {filename}: {e}")
+
+    threading.Thread(target=process_in_background, daemon=True).start()
+    return jsonify({"status": "accepted", "pdfs": len(pdfs)}), 200
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
