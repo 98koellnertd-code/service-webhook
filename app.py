@@ -1,19 +1,15 @@
 """
-Mailgun Inbound Webhook – empfängt Serviceberichte per E-Mail und speichert sie in der DB.
+Brevo Inbound Webhook – empfängt Serviceberichte per E-Mail und speichert sie in der DB.
 
 Ablauf:
-  Mail mit PDF-Anhang → Mailgun → POST /webhook/mailgun → Claude analysiert → PostgreSQL
+  Mail mit PDF-Anhang → Brevo → POST /webhook/brevo?token=SECRET → Claude analysiert → PostgreSQL
 
 Setup:
-  1. Railway: Neues Projekt, diesen webhook/-Ordner deployen
-  2. Env-Variablen in Railway setzen (siehe .env.example)
-  3. Mailgun: Route anlegen → Forward to → https://<deine-railway-url>/webhook/mailgun
+  1. Railway: Env-Variablen setzen (ANTHROPIC_API_KEY, DATABASE_URL, WEBHOOK_TOKEN)
+  2. Brevo: Inbound Parsing → Webhook URL: https://swebhook.up.railway.app/webhook/brevo?token=DEIN_TOKEN
 """
 
 import os
-import hmac
-import hashlib
-import tempfile
 import logging
 import json
 import base64
@@ -30,9 +26,9 @@ import anthropic
 import psycopg2
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
-DATABASE_URL        = os.environ["DATABASE_URL"]
-MAILGUN_SIGNING_KEY = os.getenv("MAILGUN_SIGNING_KEY", "")
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+DATABASE_URL      = os.environ["DATABASE_URL"]
+WEBHOOK_TOKEN     = os.getenv("WEBHOOK_TOKEN", "")  # optionaler Schutz-Token
 
 app    = Flask(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -43,19 +39,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Sicherheit
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _verify_mailgun(token: str, timestamp: str, signature: str) -> bool:
-    """Prüft die Mailgun HMAC-Signatur. Gibt True zurück wenn MAILGUN_SIGNING_KEY leer."""
-    if not MAILGUN_SIGNING_KEY:
-        log.warning("MAILGUN_SIGNING_KEY nicht gesetzt – Signaturprüfung übersprungen")
-        return True
-    data     = f"{timestamp}{token}".encode()
-    computed = hmac.new(MAILGUN_SIGNING_KEY.encode(), data, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(computed, signature)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PDF-Analyse via Claude
@@ -198,42 +181,41 @@ def speichere_in_db(daten: dict) -> int:
     return bericht_id
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Webhook-Endpoint
+#  Webhook-Endpoint (Brevo)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.route("/webhook/mailgun", methods=["POST"])
-def mailgun_inbound():
-    # ── Signatur prüfen ───────────────────────────────────────────────────────
-    token     = request.form.get("token",     "")
-    timestamp = request.form.get("timestamp", "")
-    signature = request.form.get("signature", "")
-
-    if not _verify_mailgun(token, timestamp, signature):
-        log.warning("Ungültige Mailgun-Signatur – Anfrage abgewiesen")
+@app.route("/webhook/brevo", methods=["POST"])
+def brevo_inbound():
+    # ── Token-Prüfung ─────────────────────────────────────────────────────────
+    if WEBHOOK_TOKEN and request.args.get("token") != WEBHOOK_TOKEN:
+        log.warning("Ungültiger Token – Anfrage abgewiesen")
         return jsonify({"error": "forbidden"}), 403
 
-    sender  = request.form.get("from",    "?")
-    subject = request.form.get("subject", "")
-    n_att   = int(request.form.get("attachment-count", 0))
-    log.info(f"Mail von {sender!r}  Betreff: {subject!r}  Anhänge: {n_att}")
+    data = request.get_json(force=True, silent=True) or {}
 
-    if n_att == 0:
+    sender  = (data.get("From") or {}).get("Address", "?")
+    subject = data.get("Subject", "")
+    attachments = data.get("Attachments") or []
+
+    log.info(f"Mail von {sender!r}  Betreff: {subject!r}  Anhänge: {len(attachments)}")
+
+    if not attachments:
         return jsonify({"status": "no_attachments"}), 200
 
     processed, errors = [], []
 
-    for i in range(1, n_att + 1):
-        f = request.files.get(f"attachment-{i}")
-        if not f:
-            continue
-        if not f.filename.lower().endswith(".pdf"):
-            log.info(f"  Anhang {i} ({f.filename}) ist kein PDF – übersprungen")
+    for att in attachments:
+        name         = att.get("Name", "")
+        content_type = att.get("ContentType", "")
+        b64_content  = att.get("Base64Content", "")
+
+        if not name.lower().endswith(".pdf") and "pdf" not in content_type.lower():
+            log.info(f"  {name} ist kein PDF – übersprungen")
             continue
 
-        log.info(f"  Analysiere {f.filename} …")
-        pdf_bytes = f.read()
-
+        log.info(f"  Analysiere {name} …")
         try:
+            pdf_bytes  = base64.b64decode(b64_content)
             daten      = analysiere_pdf(pdf_bytes)
             bericht_id = speichere_in_db(daten)
             terminnr   = daten.get("terminnummer", "?")
@@ -241,14 +223,14 @@ def mailgun_inbound():
             log.info(f"  ✅ Bericht-ID {bericht_id}: {terminnr} – {kunde}")
             processed.append({"terminnr": terminnr, "kunde": kunde, "id": bericht_id})
         except Exception as e:
-            log.error(f"  ❌ Fehler bei {f.filename}: {e}")
-            errors.append({"file": f.filename, "error": str(e)})
+            log.error(f"  ❌ Fehler bei {name}: {e}")
+            errors.append({"file": name, "error": str(e)})
 
     status = "ok" if not errors else ("partial" if processed else "error")
     return jsonify({"status": status, "processed": processed, "errors": errors}), 200
 
 
-# ── Health-Check für Railway ──────────────────────────────────────────────────
+# ── Health-Check ──────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
