@@ -1,0 +1,23 @@
+# --- Geheimnisse / Konfiguration (niemals hochladen) ---
+res/
+interne docs/
+dist/
+
+# --- Fremd-Code (wird per Composer installiert) ---
+composer.lock
+
+# --- System-Müll ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Editor-/IDE-Dateien ---
+.idea/
+.vscode/
+*.sublime-*
+*.swp
+*~
+
+# --- Logs & Temp ---
+*.log
+*.tmp
